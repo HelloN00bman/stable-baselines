@@ -43,13 +43,19 @@ class TransitionClassifier(object):
         :param hidden_size: ([int]) the hidden dimension for the MLP
         :param entcoeff: (float) the entropy loss weight
         :param scope: (str) tensorflow variable scope
-        :param normalize: (bool) Whether to normalize the reward or not
+        :param normalize: (bool) Wether to normalize the reward or not
         """
         # TODO: support images properly (using a CNN)
         self.scope = scope
-        self.observation_shape = observation_space.shape
-        self.actions_shape = action_space.shape
-
+        try:
+            self.observation_shape = observation_space.shape
+        except:
+            self.observation_shape = observation_space.high.shape
+        try:
+            self.actions_shape = action_space.shape
+        except:
+            self.actions_shape = tuple([action_space.n])
+            
         if isinstance(action_space, gym.spaces.Box):
             # Continuous action space
             self.discrete_actions = False
@@ -128,7 +134,12 @@ class TransitionClassifier(object):
             else:
                 actions_ph = acs_ph
 
-            _input = tf.concat([obs, actions_ph], axis=1)  # concatenate the two input -> form a transition
+            try:
+                _input = tf.concat([obs, actions_ph], axis=1)  # concatenate the two input -> form a transition
+            except:
+                actions_ph = acs_ph
+                actions_ph = tf.cast(actions_ph, tf.float32)
+                _input = tf.concat([obs, actions_ph], axis=1)
             p_h1 = tf.contrib.layers.fully_connected(_input, self.hidden_size, activation_fn=tf.nn.tanh)
             p_h2 = tf.contrib.layers.fully_connected(p_h1, self.hidden_size, activation_fn=tf.nn.tanh)
             logits = tf.contrib.layers.fully_connected(p_h2, 1, activation_fn=tf.identity)

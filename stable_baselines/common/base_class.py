@@ -2,7 +2,6 @@ from abc import ABC, abstractmethod
 import os
 import glob
 import warnings
-from collections import OrderedDict
 
 import cloudpickle
 import numpy as np
@@ -10,7 +9,7 @@ import gym
 import tensorflow as tf
 
 from stable_baselines.common import set_global_seeds
-from stable_baselines.common.policies import get_policy_from_name, ActorCriticPolicy
+from stable_baselines.common.policies import LstmPolicy, get_policy_from_name, ActorCriticPolicy
 from stable_baselines.common.vec_env import VecEnvWrapper, VecEnv, DummyVecEnv
 from stable_baselines import logger
 
@@ -28,7 +27,7 @@ class BaseRLModel(ABC):
     """
 
     def __init__(self, policy, env, verbose=0, *, requires_vec_env, policy_base, policy_kwargs=None):
-        if isinstance(policy, str) and policy_base is not None:
+        if isinstance(policy, str):
             self.policy = get_policy_from_name(policy_base, policy)
         else:
             self.policy = policy
@@ -44,7 +43,6 @@ class BaseRLModel(ABC):
         self.graph = None
         self.sess = None
         self.params = None
-        self._param_load_ops = None
 
         if env is not None:
             if isinstance(env, str):
@@ -100,7 +98,7 @@ class BaseRLModel(ABC):
             assert isinstance(env, VecEnv), \
                 "Error: the environment passed is not a vectorized environment, however {} requires it".format(
                     self.__class__.__name__)
-            assert not self.policy.recurrent or self.n_envs == env.num_envs, \
+            assert not issubclass(self.policy, LstmPolicy) or self.n_envs == env.num_envs, \
                 "Error: the environment passed must have the same number of environments as the model was trained on." \
                 "This is due to the Lstm policy not being capable of changing the number of environments."
             self.n_envs = env.num_envs
@@ -156,49 +154,6 @@ class BaseRLModel(ABC):
             set_global_seeds(seed)
 
     @abstractmethod
-    def get_parameter_list(self):
-        """
-        Get tensorflow Variables of model's parameters
-
-        This includes all variables necessary for continuing training (saving / loading).
-
-        :return: (list) List of tensorflow Variables
-        """
-        pass
-
-    def get_parameters(self):
-        """
-        Get current model parameters as dictionary of variable name -> ndarray.
-
-        :return: (OrderedDict) Dictionary of variable name -> ndarray of model's parameters.
-        """
-        parameters = self.get_parameter_list()
-        parameter_values = self.sess.run(parameters)
-        return_dictionary = OrderedDict((param.name, value) for param, value in zip(parameters, parameter_values))
-        return return_dictionary
-
-    def _setup_load_operations(self):
-        """
-        Create tensorflow operations for loading model parameters
-        """
-        # Assume tensorflow graphs are static -> check
-        # that we only call this function once
-        if self._param_load_ops is not None:
-            raise RuntimeError("Parameter load operations have already been created")
-        # For each loadable parameter, create appropiate
-        # placeholder and an assign op, and store them to
-        # self.load_param_ops as dict of variable.name -> (placeholder, assign)
-        loadable_parameters = self.get_parameter_list()
-        # Use OrderedDict to store order for backwards compatibility with
-        # list-based params
-        self._param_load_ops = OrderedDict()
-        with self.graph.as_default():
-            for param in loadable_parameters:
-                placeholder = tf.placeholder(dtype=param.dtype, shape=param.shape)
-                # param.name is unique (tensorflow variables have unique names)
-                self._param_load_ops[param.name] = (placeholder, param.assign(placeholder))
-
-    @abstractmethod
     def _get_pretrain_placeholders(self):
         """
         Return the placeholders needed for the pretraining:
@@ -213,7 +168,7 @@ class BaseRLModel(ABC):
         pass
 
     def pretrain(self, dataset, n_epochs=10, learning_rate=1e-4,
-                 adam_epsilon=1e-8, val_interval=None):
+                 adam_epsilon=1e-8, val_interval=None, save_dir=None):
         """
         Pretrain a model using behavior cloning:
         supervised learning given an expert dataset.
@@ -265,6 +220,8 @@ class BaseRLModel(ABC):
         if self.verbose > 0:
             print("Pretraining with Behavior Cloning...")
 
+        best_accuracy, best_loss = 0, np.inf
+        train_losses, val_losses, val_accuracies = [], [], []
         for epoch_idx in range(int(n_epochs)):
             train_loss = 0.0
             # Full pass on the training set
@@ -284,20 +241,47 @@ class BaseRLModel(ABC):
                 # Full pass on the validation set
                 for _ in range(len(dataset.val_loader)):
                     expert_obs, expert_actions = dataset.get_next_batch('val')
-                    val_loss_, = self.sess.run([loss], {obs_ph: expert_obs,
+                    val_loss_, predicted_actions = self.sess.run([loss, actions_logits_ph], {obs_ph: expert_obs,
                                                         actions_ph: expert_actions})
+                    # TODO: figure out why accuracy seems weird?
+                    # print(expert_actions.shape)
+                    val_accuracy = np.mean(np.equal(expert_actions, np.argmax(predicted_actions, axis=1)))
                     val_loss += val_loss_
-
                 val_loss /= len(dataset.val_loader)
+
+                # TODO: Save highest accuracy and lowest loss models
+                if val_accuracy > best_accuracy and save_dir is not None:
+                    print("SAVING BEST ACC")
+                    best_accuracy = val_accuracy
+                    self.save(save_dir + "best_acc", include_data=False)
+
+                if val_loss < best_loss and save_dir is not None:
+                    print("SAVING BEST LOSS")
+                    best_loss = val_loss
+                    self.save(save_dir + "best_loss", include_data=False)
+
+                train_losses.append(train_loss)
+                val_losses.append(val_loss)
+                val_accuracies.append(val_accuracy)
+
                 if self.verbose > 0:
                     print("==== Training progress {:.2f}% ====".format(100 * (epoch_idx + 1) / n_epochs))
                     print('Epoch {}'.format(epoch_idx + 1))
-                    print("Training loss: {:.6f}, Validation loss: {:.6f}".format(train_loss, val_loss))
+                    print("Training loss: {:.6f}, Validation loss: {:.6f}, Accuracy: {:.6f}".format(
+                        train_loss, val_loss, val_accuracy
+                    ))
                     print()
             # Free memory
             del expert_obs, expert_actions
         if self.verbose > 0:
             print("Pretraining done.")
+        self.bc_info = {
+            "train_losses": train_losses, 
+            "val_losses": val_losses,
+            "val_accuracies": val_accuracies,
+            "training_dataset_size": len(dataset.train_loader),
+            "validation_dataset_size": len(dataset.val_loader)
+        }
         return self
 
     @abstractmethod
@@ -331,19 +315,21 @@ class BaseRLModel(ABC):
         pass
 
     @abstractmethod
-    def action_probability(self, observation, state=None, mask=None, actions=None, logp=False):
+    def action_probability(self, observation, state=None, mask=None, actions=None):
         """
-        If ``actions`` is ``None``, then get the model's action probability distribution from a given observation.
+        If ``actions`` is ``None``, then get the model's action probability distribution from a given observation
 
-        Depending on the action space the output is:
+        depending on the action space the output is:
             - Discrete: probability for each possible action
             - Box: mean and standard deviation of the action output
 
         However if ``actions`` is not ``None``, this function will return the probability that the given actions are
-        taken with the given parameters (observation, state, ...) on this model. For discrete action spaces, it
-        returns the probability mass; for continuous action spaces, the probability density. This is since the
-        probability mass will always be zero in continuous spaces, see http://blog.christianperone.com/2019/01/
-        for a good explanation
+        taken with the given parameters (observation, state, ...) on this model.
+
+        .. warning::
+            When working with continuous probability distribution (e.g. Gaussian distribution for continuous action)
+            the probability of taking a particular action is exactly zero.
+            See http://blog.christianperone.com/2019/01/ for a good explanation
 
         :param observation: (np.ndarray) the input observation
         :param state: (np.ndarray) The last states (can be None, used in recurrent policies)
@@ -351,75 +337,9 @@ class BaseRLModel(ABC):
         :param actions: (np.ndarray) (OPTIONAL) For calculating the likelihood that the given actions are chosen by
             the model for each of the given parameters. Must have the same number of actions and observations.
             (set to None to return the complete action probability distribution)
-        :param logp: (bool) (OPTIONAL) When specified with actions, returns probability in log-space.
-            This has no effect if actions is None.
-        :return: (np.ndarray) the model's (log) action probability
+        :return: (np.ndarray) the model's action probability
         """
         pass
-
-    def load_parameters(self, load_path_or_dict, exact_match=True):
-        """
-        Load model parameters from a file or a dictionary
-
-        Dictionary keys should be tensorflow variable names, which can be obtained
-        with ``get_parameters`` function. If ``exact_match`` is True, dictionary
-        should contain keys for all model's parameters, otherwise RunTimeError
-        is raised. If False, only variables included in the dictionary will be updated.
-
-        This does not load agent's hyper-parameters.
-
-        .. warning::
-            This function does not update trainer/optimizer variables (e.g. momentum).
-            As such training after using this function may lead to less-than-optimal results.
-
-        :param load_path_or_dict: (str or file-like or dict) Save parameter location
-            or dict of parameters as variable.name -> ndarrays to be loaded.
-        :param exact_match: (bool) If True, expects load dictionary to contain keys for
-            all variables in the model. If False, loads parameters only for variables
-            mentioned in the dictionary. Defaults to True.
-        """
-        # Make sure we have assign ops
-        if self._param_load_ops is None:
-            self._setup_load_operations()
-
-        params = None
-        if isinstance(load_path_or_dict, dict):
-            # Assume `load_path_or_dict` is dict of variable.name -> ndarrays we want to load
-            params = load_path_or_dict
-        elif isinstance(load_path_or_dict, list):
-            warnings.warn("Loading model parameters from a list. This has been replaced " +
-                          "with parameter dictionaries with variable names and parameters. " +
-                          "If you are loading from a file, consider re-saving the file.",
-                          DeprecationWarning)
-            # Assume `load_path_or_dict` is list of ndarrays.
-            # Create param dictionary assuming the parameters are in same order
-            # as `get_parameter_list` returns them.
-            params = dict()
-            for i, param_name in enumerate(self._param_load_ops.keys()):
-                params[param_name] = load_path_or_dict[i]
-        else:
-            # Assume a filepath or file-like.
-            # Use existing deserializer to load the parameters
-            _, params = BaseRLModel._load_from_file(load_path_or_dict)
-
-        feed_dict = {}
-        param_update_ops = []
-        # Keep track of not-updated variables
-        not_updated_variables = set(self._param_load_ops.keys())
-        for param_name, param_value in params.items():
-            placeholder, assign_op = self._param_load_ops[param_name]
-            feed_dict[placeholder] = param_value
-            # Create list of tf.assign operations for sess.run
-            param_update_ops.append(assign_op)
-            # Keep track which variables are updated
-            not_updated_variables.remove(param_name)
-
-        # Check that we updated all parameters if exact_match=True
-        if exact_match and len(not_updated_variables) > 0:
-            raise RuntimeError("Load dictionary did not contain all variables. " +
-                               "Missing variables: {}".format(", ".join(not_updated_variables)))
-
-        self.sess.run(param_update_ops, feed_dict=feed_dict)
 
     @abstractmethod
     def save(self, save_path):
@@ -428,6 +348,7 @@ class BaseRLModel(ABC):
 
         :param save_path: (str or file-like object) the save location
         """
+        # self._save_to_file(save_path, data={}, params=None)
         raise NotImplementedError()
 
     @classmethod
@@ -441,6 +362,7 @@ class BaseRLModel(ABC):
             (can be None if you only need prediction from a trained model)
         :param kwargs: extra arguments to change the model when loading
         """
+        # data, param = cls._load_from_file(load_path)
         raise NotImplementedError()
 
     @staticmethod
@@ -495,15 +417,26 @@ class BaseRLModel(ABC):
         :return: (bool) whether the given observation is vectorized or not
         """
         if isinstance(observation_space, gym.spaces.Box):
-            if observation.shape == observation_space.shape:
-                return False
-            elif observation.shape[1:] == observation_space.shape:
-                return True
-            else:
-                raise ValueError("Error: Unexpected observation shape {} for ".format(observation.shape) +
-                                 "Box environment, please use {} ".format(observation_space.shape) +
-                                 "or (n_env, {}) for the observation shape."
-                                 .format(", ".join(map(str, observation_space.shape))))
+            try:
+                if observation.shape == observation_space.shape:
+                    return False
+                elif observation.shape[1:] == observation_space.shape:
+                    return True
+                else:
+                    raise ValueError("Error: Unexpected observation shape {} for ".format(observation.shape) +
+                                    "Box environment, please use {} ".format(observation_space.shape) +
+                                    "or (n_env, {}) for the observation shape."
+                                    .format(", ".join(map(str, observation_space.shape))))
+            except:
+                if observation.shape == observation_space.high.shape:
+                    return False
+                elif observation.shape[1:] == observation_space.high.shape:
+                    return True
+                else:
+                    raise ValueError("Error: Unexpected observation shape {} for ".format(observation.shape) +
+                                    "Box environment, please use {} ".format(observation_space.shape) +
+                                    "or (n_env, {}) for the observation shape."
+                                    .format(", ".join(map(str, observation_space.shape))))
         elif isinstance(observation_space, gym.spaces.Discrete):
             if observation.shape == ():  # A numpy array of a number, has shape empty tuple '()'
                 return False
@@ -575,7 +508,11 @@ class ActorCriticRLModel(BaseRLModel):
         observation = np.array(observation)
         vectorized_env = self._is_vectorized_observation(observation, self.observation_space)
 
-        observation = observation.reshape((-1,) + self.observation_space.shape)
+        try:
+            observation = observation.reshape((-1,) + self.observation_space.shape)
+        except:
+            observation = observation.reshape((-1,) + self.observation_space.high.shape)
+
         actions, _, states, _ = self.step(observation, state, mask, deterministic=deterministic)
 
         clipped_actions = actions
@@ -590,7 +527,7 @@ class ActorCriticRLModel(BaseRLModel):
 
         return clipped_actions, states
 
-    def action_probability(self, observation, state=None, mask=None, actions=None, logp=False):
+    def action_probability(self, observation, state=None, mask=None, actions=None):
         if state is None:
             state = self.initial_state
         if mask is None:
@@ -598,7 +535,11 @@ class ActorCriticRLModel(BaseRLModel):
         observation = np.array(observation)
         vectorized_env = self._is_vectorized_observation(observation, self.observation_space)
 
-        observation = observation.reshape((-1,) + self.observation_space.shape)
+        try:
+            observation = observation.reshape((-1,) + self.observation_space.shape)
+        except:
+            observation = observation.reshape((-1,) + self.observation_space.high.shape)
+
         actions_proba = self.proba_step(observation, state, mask)
 
         if len(actions_proba) == 0:  # empty list means not implemented
@@ -607,14 +548,12 @@ class ActorCriticRLModel(BaseRLModel):
             return None
 
         if actions is not None:  # comparing the action distribution, to given actions
-            prob = None
-            logprob = None
             actions = np.array([actions])
             if isinstance(self.action_space, gym.spaces.Discrete):
                 actions = actions.reshape((-1,))
                 assert observation.shape[0] == actions.shape[0], \
                     "Error: batch sizes differ for actions and observations."
-                prob = actions_proba[np.arange(actions.shape[0]), actions]
+                actions_proba = actions_proba[np.arange(actions.shape[0]), actions]
 
             elif isinstance(self.action_space, gym.spaces.MultiDiscrete):
                 actions = actions.reshape((-1, len(self.action_space.nvec)))
@@ -622,7 +561,7 @@ class ActorCriticRLModel(BaseRLModel):
                     "Error: batch sizes differ for actions and observations."
                 # Discrete action probability, over multiple categories
                 actions = np.swapaxes(actions, 0, 1)  # swap axis for easier categorical split
-                prob = np.prod([proba[np.arange(act.shape[0]), act]
+                actions_proba = np.prod([proba[np.arange(act.shape[0]), act]
                                          for proba, act in zip(actions_proba, actions)], axis=0)
 
             elif isinstance(self.action_space, gym.spaces.MultiBinary):
@@ -630,48 +569,25 @@ class ActorCriticRLModel(BaseRLModel):
                 assert observation.shape[0] == actions.shape[0], \
                     "Error: batch sizes differ for actions and observations."
                 # Bernoulli action probability, for every action
-                prob = np.prod(actions_proba * actions + (1 - actions_proba) * (1 - actions), axis=1)
+                actions_proba = np.prod(actions_proba * actions + (1 - actions_proba) * (1 - actions), axis=1)
 
             elif isinstance(self.action_space, gym.spaces.Box):
-                actions = actions.reshape((-1, ) + self.action_space.shape)
-                mean, logstd = actions_proba
-                std = np.exp(logstd)
-
-                n_elts = np.prod(mean.shape[1:])  # first dimension is batch size
-                log_normalizer = n_elts/2 * np.log(2 * np.pi) + 1/2 * np.sum(logstd, axis=1)
-
-                # Diagonal Gaussian action probability, for every action
-                logprob = -np.sum(np.square(actions - mean) / (2 * std), axis=1) - log_normalizer
-
+                warnings.warn("The probabilty of taken a given action is exactly zero for a continuous distribution."
+                              "See http://blog.christianperone.com/2019/01/ for a good explanation")
+                actions_proba = np.zeros((observation.shape[0], 1), dtype=np.float32)
             else:
                 warnings.warn("Warning: action_probability not implemented for {} actions space. Returning None."
                               .format(type(self.action_space).__name__))
                 return None
-
-            # Return in space (log or normal) requested by user, converting if necessary
-            if logp:
-                if logprob is None:
-                    logprob = np.log(prob)
-                ret = logprob
-            else:
-                if prob is None:
-                    prob = np.exp(logprob)
-                ret = prob
-
             # normalize action proba shape for the different gym spaces
-            ret = ret.reshape((-1, 1))
-        else:
-            ret = actions_proba
+            actions_proba = actions_proba.reshape((-1, 1))
 
         if not vectorized_env:
             if state is not None:
                 raise ValueError("Error: The environment must be vectorized when using recurrent policies.")
-            ret = ret[0]
+            actions_proba = actions_proba[0]
 
-        return ret
-
-    def get_parameter_list(self):
-        return self.params
+        return actions_proba
 
     @abstractmethod
     def save(self, save_path):
@@ -679,14 +595,6 @@ class ActorCriticRLModel(BaseRLModel):
 
     @classmethod
     def load(cls, load_path, env=None, **kwargs):
-        """
-        Load the model from file
-
-        :param load_path: (str or file-like) the saved parameter location
-        :param env: (Gym Envrionment) the new environment to run the loaded model on
-            (can be None if you only need prediction from a trained model)
-        :param kwargs: extra arguments to change the model when loading
-        """
         data, params = cls._load_from_file(load_path)
 
         if 'policy_kwargs' in kwargs and kwargs['policy_kwargs'] != data['policy_kwargs']:
@@ -700,7 +608,10 @@ class ActorCriticRLModel(BaseRLModel):
         model.set_env(env)
         model.setup_model()
 
-        model.load_parameters(params)
+        restores = []
+        for param, loaded_p in zip(model.params, params):
+            restores.append(param.assign(loaded_p))
+        model.sess.run(restores)
 
         return model
 
@@ -718,8 +629,7 @@ class OffPolicyRLModel(BaseRLModel):
     :param policy_base: (BasePolicy) the base policy used by this method
     """
 
-    def __init__(self, policy, env, replay_buffer=None, _init_setup_model=False, verbose=0, *,
-                 requires_vec_env=False, policy_base=None, policy_kwargs=None):
+    def __init__(self, policy, env, replay_buffer, verbose=0, *, requires_vec_env, policy_base, policy_kwargs=None):
         super(OffPolicyRLModel, self).__init__(policy, env, verbose=verbose, requires_vec_env=requires_vec_env,
                                                policy_base=policy_base, policy_kwargs=policy_kwargs)
 
@@ -731,7 +641,7 @@ class OffPolicyRLModel(BaseRLModel):
 
     @abstractmethod
     def learn(self, total_timesteps, callback=None, seed=None,
-              log_interval=100, tb_log_name="run", reset_num_timesteps=True, replay_wrapper=None):
+              log_interval=100, tb_log_name="run", reset_num_timesteps=True):
         pass
 
     @abstractmethod
@@ -739,7 +649,7 @@ class OffPolicyRLModel(BaseRLModel):
         pass
 
     @abstractmethod
-    def action_probability(self, observation, state=None, mask=None, actions=None, logp=False):
+    def action_probability(self, observation, state=None, mask=None, actions=None):
         pass
 
     @abstractmethod
@@ -747,31 +657,10 @@ class OffPolicyRLModel(BaseRLModel):
         pass
 
     @classmethod
+    @abstractmethod
     def load(cls, load_path, env=None, **kwargs):
-        """
-        Load the model from file
+        pass
 
-        :param load_path: (str or file-like) the saved parameter location
-        :param env: (Gym Envrionment) the new environment to run the loaded model on
-            (can be None if you only need prediction from a trained model)
-        :param kwargs: extra arguments to change the model when loading
-        """
-        data, params = cls._load_from_file(load_path)
-
-        if 'policy_kwargs' in kwargs and kwargs['policy_kwargs'] != data['policy_kwargs']:
-            raise ValueError("The specified policy kwargs do not equal the stored policy kwargs. "
-                             "Stored kwargs: {}, specified kwargs: {}".format(data['policy_kwargs'],
-                                                                              kwargs['policy_kwargs']))
-
-        model = cls(policy=data["policy"], env=None, _init_setup_model=False)
-        model.__dict__.update(data)
-        model.__dict__.update(kwargs)
-        model.set_env(env)
-        model.setup_model()
-
-        model.load_parameters(params)
-
-        return model
 
 class _UnvecWrapper(VecEnvWrapper):
     def __init__(self, venv):
@@ -783,43 +672,15 @@ class _UnvecWrapper(VecEnvWrapper):
         super().__init__(venv)
         assert venv.num_envs == 1, "Error: cannot unwrap a environment wrapper that has more than one environment."
 
-    def __getattr__(self, attr):
-        if attr in self.__dict__:
-            return getattr(self, attr)
-        return getattr(self.venv, attr)
-
-    def __set_attr__(self, attr, value):
-        if attr in self.__dict__:
-            setattr(self, attr, value)
-        else:
-            setattr(self.venv, attr, value)
-
-    def compute_reward(self, achieved_goal, desired_goal, _info):
-        return float(self.venv.env_method('compute_reward', achieved_goal, desired_goal, _info)[0])
-
-    @staticmethod
-    def unvec_obs(obs):
-        """
-        :param obs: (Union[np.ndarray, dict])
-        :return: (Union[np.ndarray, dict])
-        """
-        if not isinstance(obs, dict):
-            return obs[0]
-        obs_ = OrderedDict()
-        for key in obs.keys():
-            obs_[key] = obs[key][0]
-        del obs
-        return obs_
-
     def reset(self):
-        return self.unvec_obs(self.venv.reset())
+        return self.venv.reset()[0]
 
     def step_async(self, actions):
         self.venv.step_async([actions])
 
     def step_wait(self):
-        obs, rewards, dones, information = self.venv.step_wait()
-        return self.unvec_obs(obs), float(rewards[0]), dones[0], information[0]
+        actions, values, states, information = self.venv.step_wait()
+        return actions[0], float(values[0]), states[0], information[0]
 
     def render(self, mode='human'):
         return self.venv.render(mode=mode)
@@ -888,8 +749,8 @@ class TensorboardWriter:
         :return: (int) latest run number
         """
         max_run_id = 0
-        for path in glob.glob("{}/{}_[0-9]*".format(self.tensorboard_log_path, self.tb_log_name)):
-            file_name = path.split(os.sep)[-1]
+        for path in glob.glob(self.tensorboard_log_path + "/{}_[0-9]*".format(self.tb_log_name)):
+            file_name = path.split("/")[-1]
             ext = file_name.split("_")[-1]
             if self.tb_log_name == "_".join(file_name.split("_")[:-1]) and ext.isdigit() and int(ext) > max_run_id:
                 max_run_id = int(ext)
