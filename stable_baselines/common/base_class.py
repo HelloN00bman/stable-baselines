@@ -417,15 +417,26 @@ class BaseRLModel(ABC):
         :return: (bool) whether the given observation is vectorized or not
         """
         if isinstance(observation_space, gym.spaces.Box):
-            if observation.shape == observation_space.shape:
-                return False
-            elif observation.shape[1:] == observation_space.shape:
-                return True
-            else:
-                raise ValueError("Error: Unexpected observation shape {} for ".format(observation.shape) +
-                                 "Box environment, please use {} ".format(observation_space.shape) +
-                                 "or (n_env, {}) for the observation shape."
-                                 .format(", ".join(map(str, observation_space.shape))))
+            try:
+                if observation.shape == observation_space.shape:
+                    return False
+                elif observation.shape[1:] == observation_space.shape:
+                    return True
+                else:
+                    raise ValueError("Error: Unexpected observation shape {} for ".format(observation.shape) +
+                                    "Box environment, please use {} ".format(observation_space.shape) +
+                                    "or (n_env, {}) for the observation shape."
+                                    .format(", ".join(map(str, observation_space.shape))))
+            except:
+                if observation.shape == observation_space.high.shape:
+                    return False
+                elif observation.shape[1:] == observation_space.high.shape:
+                    return True
+                else:
+                    raise ValueError("Error: Unexpected observation shape {} for ".format(observation.shape) +
+                                    "Box environment, please use {} ".format(observation_space.shape) +
+                                    "or (n_env, {}) for the observation shape."
+                                    .format(", ".join(map(str, observation_space.shape))))
         elif isinstance(observation_space, gym.spaces.Discrete):
             if observation.shape == ():  # A numpy array of a number, has shape empty tuple '()'
                 return False
@@ -497,7 +508,11 @@ class ActorCriticRLModel(BaseRLModel):
         observation = np.array(observation)
         vectorized_env = self._is_vectorized_observation(observation, self.observation_space)
 
-        observation = observation.reshape((-1,) + self.observation_space.shape)
+        try:
+            observation = observation.reshape((-1,) + self.observation_space.shape)
+        except:
+            observation = observation.reshape((-1,) + self.observation_space.high.shape)
+
         actions, _, states, _ = self.step(observation, state, mask, deterministic=deterministic)
 
         clipped_actions = actions
@@ -520,7 +535,11 @@ class ActorCriticRLModel(BaseRLModel):
         observation = np.array(observation)
         vectorized_env = self._is_vectorized_observation(observation, self.observation_space)
 
-        observation = observation.reshape((-1,) + self.observation_space.shape)
+        try:
+            observation = observation.reshape((-1,) + self.observation_space.shape)
+        except:
+            observation = observation.reshape((-1,) + self.observation_space.high.shape)
+
         actions_proba = self.proba_step(observation, state, mask)
 
         if len(actions_proba) == 0:  # empty list means not implemented
