@@ -22,7 +22,10 @@ def observation_input(ob_space, batch_size=None, name='Ob', scale=False):
         return observation_ph, processed_observations
 
     elif isinstance(ob_space, Box):
-        observation_ph = tf.placeholder(shape=(batch_size,) + ob_space.shape, dtype=ob_space.dtype, name=name)
+        try:
+            observation_ph = tf.placeholder(shape=(batch_size,) + ob_space.shape, dtype=ob_space.dtype, name=name)
+        except:
+            observation_ph = tf.placeholder(shape=(batch_size,) + ob_space.high.shape, dtype=ob_space.dtype, name=name)
         processed_observations = tf.cast(observation_ph, tf.float32)
         # rescale to [1, 0] if the bounds are defined
         if (scale and
